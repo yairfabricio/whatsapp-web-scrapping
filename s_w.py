@@ -12,7 +12,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
 
-
+TIME_LIMIT_SECONDS = 5 * 60  # 5 minutos
 # ======================================================
 # 1) DRIVER (perfil persistente)
 # ======================================================
@@ -180,7 +180,7 @@ def click_load_older_if_present(driver):
 # 5) SCRAPEAR MENSAJES DEL CHAT ABIERTO
 # ======================================================
 
-def scrape_messages_from_current_chat(driver, contact):
+def scrape_messages_from_current_chat(driver, contact,deadline_ts=None):
     # Esperar zona del chat
     WebDriverWait(driver, 25).until(
         EC.presence_of_element_located((By.CSS_SELECTOR, "div.copyable-area"))
@@ -197,6 +197,9 @@ def scrape_messages_from_current_chat(driver, contact):
     step = 1200  # scroll inicial
 
     while True:
+        if deadline_ts and time.time() >=deadline_ts:
+            print("⏱️ Límite de tiempo alcanzado dentro del chat. Cortando chat...")
+            break
         elements = driver.find_elements(By.XPATH, "//div[contains(@class,'copyable-text')]")
 
         for el in elements:
@@ -255,6 +258,8 @@ def main():
     driver = setup_driver()
     driver.get("https://web.whatsapp.com/")
     wait_for_whatsapp_login(driver)
+    start_ts = time.time()
+    deadline_ts = start_ts + TIME_LIMIT_SECONDS
 
     output_name = input("Nombre del archivo CSV (sin .csv): ").strip()
     safe_name = "".join(c for c in output_name if c.isalnum() or c in (" ", "_", "-")).strip().replace(" ", "-")
@@ -269,52 +274,62 @@ def main():
     pane_step = 1200
 
     print("\n🚀 Recorriendo chats: del más reciente al más antiguo...")
+    try:
 
-    for r in range(max_rounds):
-        titles = get_visible_chat_titles(driver)
-        print("DEBUG: titles visibles =", titles[:8], " total =", len(titles))
+        for r in range(max_rounds):
+            if time.time()>= deadline_ts:
+                print("⏱️ Límite de 5 minutos alcanzado. Guardando lo recolectado...")
+                break
+            titles = get_visible_chat_titles(driver)
+            print("DEBUG: titles visibles =", titles[:8], " total =", len(titles))
 
-        new_titles = [t for t in titles if t not in processed]
-
-        if not new_titles:
-            scroll_left_pane(driver, pane_step)
-            titles2 = get_visible_chat_titles(driver)
-            new_titles = [t for t in titles2 if t not in processed]
+            new_titles = [t for t in titles if t not in processed]
 
             if not new_titles:
-                print("✅ No hay más chats nuevos en el panel. Terminando.")
-                break
+                scroll_left_pane(driver, pane_step)
+                titles2 = get_visible_chat_titles(driver)
+                new_titles = [t for t in titles2 if t not in processed]
 
-        # ✅ ESTE FOR VA FUERA DEL IF
-        for title in new_titles:
-            print(f"📌 Abriendo chat: {title}")
-            try:
-                open_chat_by_title(driver, title)
-                print("📩 Extrayendo mensajes...")
-                rows = scrape_messages_from_current_chat(driver, title)
-                print(f"✅ Mensajes: {len(rows)}")
+                if not new_titles:
+                    print("✅ No hay más chats nuevos en el panel. Terminando.")
+                    break
 
-                all_rows.extend(rows)
-                processed.add(title)
+            # ✅ ESTE FOR VA FUERA DEL IF
+            for title in new_titles:
+                if time.time() >=deadline_ts:
+                    print("⏱️ Límite de 5 minutos alcanzado. Deteniendo recorrido de chats...")
+                    break
+                print(f"📌 Abriendo chat: {title}")
+                try:
+                    open_chat_by_title(driver, title)
+                    print("📩 Extrayendo mensajes...")
+                    rows = scrape_messages_from_current_chat(driver, title,deadline_ts=deadline_ts)
+                    print(f"✅ Mensajes: {len(rows)}")
 
-            except Exception as e:
-                print(f"⚠️ Error en chat '{title}': {e}")
-                processed.add(title)
-                continue
+                    all_rows.extend(rows)
+                    processed.add(title)
 
-        scroll_left_pane(driver, pane_step)
+                except Exception as e:
+                    print(f"⚠️ Error en chat '{title}': {e}")
+                    processed.add(title)
+                    continue
 
-    driver.quit()
+            scroll_left_pane(driver, pane_step)
+    finally:
+        try :
+            driver.quit()
+        except Exception:
+            pass
 
-    print(f"\n📊 Chats procesados: {len(processed)}")
-    print(f"📊 Mensajes totales recolectados: {len(all_rows)}")
+        print(f"\n📊 Chats procesados: {len(processed)}")
+        print(f"📊 Mensajes totales recolectados: {len(all_rows)}")
 
-    if not all_rows:
-        print("⚠️ No se recolectaron mensajes. No se generará CSV.")
-        return
+        if not all_rows:
+            print("⚠️ No se recolectaron mensajes. No se generará CSV.")
+            return
 
-    save_to_csv(output_csv, all_rows)
-    print(f"\n✅ CSV generado correctamente: {output_csv}")
+        save_to_csv(output_csv, all_rows)
+        print(f"\n✅ CSV generado correctamente: {output_csv}")
 
 if __name__ == "__main__":
     main()
