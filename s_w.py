@@ -11,8 +11,33 @@ from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
+from selenium.webdriver.common.keys import Keys
 
-TIME_LIMIT_SECONDS = 5 * 60  # 5 minutos
+#TIME_LIMIT_SECONDS = 5 * 60  # 5 minutos
+MAX_NON_GROUP_CHAT=1
+EXCLUDE_TITLES = {
+    "Rosmery Papel Asesora de Viajes Terandes",
+    "Canal Comercial y Ventas | TLA CTA",
+    "Salida fija Mex - Setiembre / 2025",
+    "Salida fija Mex-Julio/Agosto",
+    "Marketing Digital CTA TLA",
+    "Ross Mery Asesora De Ventas",
+    "Christian TLA",
+    "Tierras de los andes",
+    "TLA - CTA - ITT",
+    "Marketing Team 🎸 TLA- CTA",
+    "Ventas Interno",
+    "OPERACIONES TERANDES",
+    "Estrella Asesora de viajes a Perú",
+    "VENTAS REDES SOCIALES INTERNO- LEADS Mercado Latino",
+    "WhatsApp Business",
+    "CULTURAS ANDINAS",
+    "Salida fija Mex - Setiembre / 2025 🇲🇽✈️🇵🇪",
+    "Salida fija Mex-Julio/Agosto",
+    "Salida fija Mex - Octubre 2025 🥳🙌🏻"
+}
+META_BANNED_CHARS = {"*", "#", "•"} 
+
 # ======================================================
 # 1) DRIVER (perfil persistente)
 # ======================================================
@@ -80,28 +105,37 @@ def get_visible_chat_titles(driver):
     pane = WebDriverWait(driver, 20).until(
         EC.presence_of_element_located((By.ID, "pane-side"))
     )
-    WebDriverWait(driver,30).until(
-        lambda d:len(pane.find_elements(By.XPATH,".//span[@title]"))>0
-    )
-    spans = pane.find_elements(By.XPATH, ".//span[@title]")
+     # Filas del listado de chats (WhatsApp suele usar role="row")
+    rows = pane.find_elements(By.XPATH, ".//div[@role='row']")
+
     titles = []
     seen = set()
 
-    for s in spans:
-        title = (s.get_attribute("title") or "").strip()
-        if not title:
+    for row in rows:
+        try:
+            # Dentro de cada fila, el nombre/número del chat casi siempre es el primer span con title
+            name_span = row.find_element(By.XPATH, ".//span[@title and normalize-space(@title)!='']")
+            title = (name_span.get_attribute("title") or "").strip()
+
+            if not title:
+                continue
+            if "\n" in title:
+                continue
+            if len(title) > 60:
+                continue
+            if title in ("Archivados", "WhatsApp"):
+                continue
+
+            if title not in seen:
+                seen.add(title)
+                titles.append(title)
+
+        except Exception:
+            # Si esa fila no tiene span title “usable”, la saltamos
             continue
-        if "\n" in title:
-            continue
-        if len (title)>60:
-            continue
-        # (opcional) descarta cosas típicas que no son chats
-        if title in ("Archivados","WhatsApp"):
-            continue
-        if title not in seen:
-            seen.add(title)
-            titles.append(title)        
+
     return titles
+    
 
 
 def scroll_left_pane(driver, step=900):
@@ -113,6 +147,23 @@ def scroll_left_pane(driver, step=900):
     )
     driver.execute_script("arguments[0].scrollTop = arguments[0].scrollTop + arguments[1];", pane, step)
     time.sleep(1.2)
+########################################## normalizar titulo
+def norm_title(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip()).lower()
+EXCLUDE_TITLES_NORM = {norm_title(t) for t in EXCLUDE_TITLES}
+######################################## detector del banner
+def end_to_end_banner_present(driver) -> bool:
+    """
+    True si aparece el banner de cifrado E2E dentro del chat.
+    """
+    try:
+        return len(driver.find_elements(
+            By.XPATH,
+            "//*[contains(., 'Los mensajes y las llamadas están cifrados de extremo a extremo')]"
+        )) > 0
+    except Exception:
+        return False
+
 # ======================================================
 # 3) FECHA (si luego quieres filtrar)
 # ======================================================
@@ -174,70 +225,168 @@ def click_load_older_if_present(driver):
         pass
 
     return False
+######################################################### detector de audio
+def bubble_has_audio(bubble) -> bool:
+    """
+    Detecta si una burbuja de mensaje parece ser un audio.
+    WhatsApp suele renderizar audios con un botón de play y/o data-icon relacionado.
+    """
+    try:
+        # 1) tag audio (a veces existe)
+        if bubble.find_elements(By.TAG_NAME, "audio"):
+            return True
 
+        # 2) íconos típicos de play/audio
+        if bubble.find_elements(By.XPATH, ".//*[@data-icon='audio-play' or @data-icon='audio-download']"):
+            return True
+        if bubble.find_elements(By.XPATH, ".//*[@data-icon='play' or @data-icon='msg-play']"):
+            return True
 
-# ======================================================
-# 5) SCRAPEAR MENSAJES DEL CHAT ABIERTO
-# ======================================================
+        # 3) aria-label (ES/EN)
+        if bubble.find_elements(By.XPATH, ".//*[contains(@aria-label,'Reproducir') or contains(@aria-label,'Play')]"):
+            return True
+        if bubble.find_elements(By.XPATH, ".//*[contains(@aria-label,'audio') or contains(@aria-label,'Audio')]"):
+            return True
+        if bubble.find_elements(By.XPATH, ".//*[contains(@aria-label,'nota de voz') or contains(@aria-label,'voice')]"):
+            return True
 
-def scrape_messages_from_current_chat(driver, contact,deadline_ts=None):
-    # Esperar zona del chat
+        # 4) fallback: burbuja tiene un botón grande (play) y NO tiene texto
+        btns = bubble.find_elements(By.XPATH, ".//button")
+        if btns:
+            txt = (bubble.text or "").strip()
+            if not txt:
+                return True
+
+    except Exception:
+        pass
+    return False
+####################################################### archivo adjunto
+
+####################################################################################################################
+
+def get_chat_scroller(driver):
+    """
+    Contenedor REAL que scrollea los mensajes del chat.
+    (confirmado por tu consola: policy 'wa.web.conversation.messages')
+    """
+    return WebDriverWait(driver, 25).until(
+        EC.presence_of_element_located(
+            (By.CSS_SELECTOR, "div.copyable-area [data-scrolltracepolicy='wa.web.conversation.messages']")
+        )
+    )
+
+def get_scroll_metrics(driver, el):
+    return driver.execute_script(
+        "return {st: arguments[0].scrollTop, sh: arguments[0].scrollHeight, ch: arguments[0].clientHeight};",
+        el
+    )
+def scroll_chat_step(driver, scroller):
+    # métricas
+    st = driver.execute_script("return arguments[0].scrollTop;", scroller) or 0
+    sh = driver.execute_script("return arguments[0].scrollHeight;", scroller) or 0
+    ch = driver.execute_script("return arguments[0].clientHeight;", scroller) or 0
+    delta = sh - ch
+
+    step = max(120, min(900, int(delta * 0.8)))
+
+    if st > 5:
+        driver.execute_script(
+            "arguments[0].scrollTop = Math.max(0, arguments[0].scrollTop - arguments[1]);",
+            scroller,
+            step
+        )
+        time.sleep(1.2)
+        return "scrolled"
+    else:
+        # arriba; espera a que cargue más
+        time.sleep(2.5)
+        return "at_top"
+########################################################################################################################
+def get_message_bubble_from_meta_el(meta_el):
+    # sube al contenedor del mensaje (burbuja) más cercano
+    return meta_el.find_element(By.XPATH, "./ancestor::div[@role='row'][1]")
+###################################################################################################################
+def bubble_has_attachment(bubble) -> bool:
+    try:
+        # tu caso: "Abrir foto" / "Abrir video"
+        if bubble.find_elements(By.XPATH, ".//*[@role='button' and @aria-label and contains(@aria-label,'Abrir')]"):
+            return True
+        if bubble.find_elements(By.XPATH, ".//*[@role='button' and @aria-label and contains(@aria-label,'Open')]"):
+            return True
+
+        # fallback: img o video dentro de la burbuja
+        if bubble.find_elements(By.XPATH, ".//img | .//video"):
+            return True
+    except Exception:
+        pass
+    return False
+
+def scrape_messages_from_current_chat(driver, contact):
     WebDriverWait(driver, 25).until(
         EC.presence_of_element_located((By.CSS_SELECTOR, "div.copyable-area"))
     )
-
-    # Contenedor scrolleable real (según tu inspector)
-    scroll_container = WebDriverWait(driver, 25).until(
-        EC.presence_of_element_located((By.CSS_SELECTOR, "div[data-tab='8']"))
-    )
+    scroller = get_chat_scroller(driver)
 
     messages = {}
-    prev_len = 0
-    stable_rounds = 0
-    step = 1200  # scroll inicial
+    idle = 0
+    last_len = 0
 
     while True:
-        if deadline_ts and time.time() >=deadline_ts:
-            print("⏱️ Límite de tiempo alcanzado dentro del chat. Cortando chat...")
-            break
-        elements = driver.find_elements(By.XPATH, "//div[contains(@class,'copyable-text')]")
-
+        # 1) Recolectar visible
+        elements = driver.find_elements(By.XPATH, "//*[@data-pre-plain-text]")
         for el in elements:
             meta = (el.get_attribute("data-pre-plain-text") or "").strip()
             text = (el.text or "").strip()
-            if not meta and not text:
+            # 🔥 AQUÍ VA: subir al contenedor burbuja del mensaje
+            try:
+                bubble = get_message_bubble_from_meta_el(el)
+                if bubble:
+                    labels = [x.get_attribute("aria-label") for x in bubble.find_elements(By.XPATH, ".//*[@role='button' and @aria-label]")]
+                    if labels:
+                        print("DEBUG labels:", labels[:5])
+            except Exception:
+                bubble = None
+            # Si no hay texto, detectar adjunto (foto/video) y marcarlo
+            if not text:
+                if bubble and bubble_has_attachment(bubble):
+                    text="[ADJUNTO]"
+            # si tampoco hay meta, no guardes
+            if not meta and text !="[ADJUNTO]":
                 continue
-
-            key = meta + "||" + text
+            if any(el in meta for el in META_BANNED_CHARS):
+                continue
+            if not meta and not text:
+                continue    
+            key = f"{meta}||{text}"
             if key not in messages:
                 messages[key] = {"contact": contact, "meta": meta, "text": text}
 
-        # Si WhatsApp pide click para traer mensajes antiguos, clickeamos y re-leemos
+        # 2) ¿ya llegamos al inicio?
+        if end_to_end_banner_present(driver):
+            print("🔒 Banner de cifrado detectado. Fin del historial alcanzado.")
+            break
+
+        # 3) Click “mensajes anteriores del teléfono” si aparece
         if click_load_older_if_present(driver):
+            time.sleep(1.8)
             continue
 
-        # cortar si ya no aparecen mensajes nuevos en 2 vueltas seguidas
-        if len(messages) == prev_len:
-            stable_rounds += 1
-            if stable_rounds >= 2:
-                break
+        # 4) Un SOLO paso de scroll
+        scroll_chat_step(driver, scroller)
+
+        # 5) Watchdog suave (para no colgarse infinito)
+        if len(messages) == last_len:
+            idle += 1
         else:
-            stable_rounds = 0
+            idle = 0
+        last_len = len(messages)
 
-        prev_len = len(messages)
-
-        # ✅ IMPORTANTE: este scroll debe estar DENTRO del while
-        driver.execute_script(
-            "arguments[0].scrollTop = arguments[0].scrollTop - arguments[1];",
-            scroll_container,
-            step
-        )
-        time.sleep(2.0)
-        step = min(step + 400, 4000)
+        if idle >= 30:
+            print("⚠️ No está avanzando (WhatsApp no carga más).")
+            input("Presiona ENTER para seguir intentando...")
+            idle = 0
 
     return list(messages.values())
-
-
 # ======================================================
 # 6) CSV
 # ======================================================
@@ -258,8 +407,6 @@ def main():
     driver = setup_driver()
     driver.get("https://web.whatsapp.com/")
     wait_for_whatsapp_login(driver)
-    start_ts = time.time()
-    deadline_ts = start_ts + TIME_LIMIT_SECONDS
 
     output_name = input("Nombre del archivo CSV (sin .csv): ").strip()
     safe_name = "".join(c for c in output_name if c.isalnum() or c in (" ", "_", "-")).strip().replace(" ", "-")
@@ -274,12 +421,10 @@ def main():
     pane_step = 1200
 
     print("\n🚀 Recorriendo chats: del más reciente al más antiguo...")
-    try:
 
+    try:
+        non_group_count=0
         for r in range(max_rounds):
-            if time.time()>= deadline_ts:
-                print("⏱️ Límite de 5 minutos alcanzado. Guardando lo recolectado...")
-                break
             titles = get_visible_chat_titles(driver)
             print("DEBUG: titles visibles =", titles[:8], " total =", len(titles))
 
@@ -294,42 +439,60 @@ def main():
                     print("✅ No hay más chats nuevos en el panel. Terminando.")
                     break
 
-            # ✅ ESTE FOR VA FUERA DEL IF
             for title in new_titles:
-                if time.time() >=deadline_ts:
-                    print("⏱️ Límite de 5 minutos alcanzado. Deteniendo recorrido de chats...")
+                # ✅ corte global si ya llegamos a 200 chats NO-grupo
+                if non_group_count >= MAX_NON_GROUP_CHAT:
+                    print(f"🛑 Límite alcanzado: {MAX_NON_GROUP_CHAT} chats (sin contar grupos).")
                     break
+                   
                 print(f"📌 Abriendo chat: {title}")
+                
+                    
+                    # si es grupo salta
+                if norm_title(title) in EXCLUDE_TITLES_NORM:
+                    print("⛔ En lista de excluidos. Saltando (no se scrapea).")
+                    processed.add(title)
+                    continue
                 try:
                     open_chat_by_title(driver, title)
                     print("📩 Extrayendo mensajes...")
-                    rows = scrape_messages_from_current_chat(driver, title,deadline_ts=deadline_ts)
+                    
+                    rows = scrape_messages_from_current_chat(driver, title)
+                    
                     print(f"✅ Mensajes: {len(rows)}")
 
                     all_rows.extend(rows)
                     processed.add(title)
-
+                    # solo chats no grupo
+                    non_group_count+=1
+                    print(f"✅ Chats no-grupo procesados: {non_group_count}/{MAX_NON_GROUP_CHAT}")
                 except Exception as e:
                     print(f"⚠️ Error en chat '{title}': {e}")
                     processed.add(title)
                     continue
-
+            if non_group_count >= MAX_NON_GROUP_CHAT:
+                break             
             scroll_left_pane(driver, pane_step)
-    finally:
-        try :
-            driver.quit()
-        except Exception:
-            pass
 
+    finally:
+        # Guardar lo que haya (si hubo)
         print(f"\n📊 Chats procesados: {len(processed)}")
         print(f"📊 Mensajes totales recolectados: {len(all_rows)}")
 
-        if not all_rows:
+        if all_rows:
+            try:
+                save_to_csv(output_csv, all_rows)
+                print(f"\n✅ CSV generado correctamente: {output_csv}")
+            except Exception as e:
+                print("⚠️ Error guardando CSV:", e)
+        else:
             print("⚠️ No se recolectaron mensajes. No se generará CSV.")
-            return
 
-        save_to_csv(output_csv, all_rows)
-        print(f"\n✅ CSV generado correctamente: {output_csv}")
+        # Cerrar el driver siempre al final
+        try:
+            driver.quit()
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     main()
