@@ -225,44 +225,11 @@ def click_load_older_if_present(driver):
         pass
 
     return False
-######################################################### detector de audio
-def bubble_has_audio(bubble) -> bool:
-    """
-    Detecta si una burbuja de mensaje parece ser un audio.
-    WhatsApp suele renderizar audios con un botón de play y/o data-icon relacionado.
-    """
-    try:
-        # 1) tag audio (a veces existe)
-        if bubble.find_elements(By.TAG_NAME, "audio"):
-            return True
 
-        # 2) íconos típicos de play/audio
-        if bubble.find_elements(By.XPATH, ".//*[@data-icon='audio-play' or @data-icon='audio-download']"):
-            return True
-        if bubble.find_elements(By.XPATH, ".//*[@data-icon='play' or @data-icon='msg-play']"):
-            return True
 
-        # 3) aria-label (ES/EN)
-        if bubble.find_elements(By.XPATH, ".//*[contains(@aria-label,'Reproducir') or contains(@aria-label,'Play')]"):
-            return True
-        if bubble.find_elements(By.XPATH, ".//*[contains(@aria-label,'audio') or contains(@aria-label,'Audio')]"):
-            return True
-        if bubble.find_elements(By.XPATH, ".//*[contains(@aria-label,'nota de voz') or contains(@aria-label,'voice')]"):
-            return True
 
-        # 4) fallback: burbuja tiene un botón grande (play) y NO tiene texto
-        btns = bubble.find_elements(By.XPATH, ".//button")
-        if btns:
-            txt = (bubble.text or "").strip()
-            if not txt:
-                return True
 
-    except Exception:
-        pass
-    return False
-####################################################### archivo adjunto
-
-####################################################################################################################
+#################################################################################################################### scroller
 
 def get_chat_scroller(driver):
     """
@@ -305,22 +272,38 @@ def scroll_chat_step(driver, scroller):
 def get_message_bubble_from_meta_el(meta_el):
     # sube al contenedor del mensaje (burbuja) más cercano
     return meta_el.find_element(By.XPATH, "./ancestor::div[@role='row'][1]")
-###################################################################################################################
-def bubble_has_attachment(bubble) -> bool:
-    try:
-        # tu caso: "Abrir foto" / "Abrir video"
-        if bubble.find_elements(By.XPATH, ".//*[@role='button' and @aria-label and contains(@aria-label,'Abrir')]"):
-            return True
-        if bubble.find_elements(By.XPATH, ".//*[@role='button' and @aria-label and contains(@aria-label,'Open')]"):
-            return True
 
-        # fallback: img o video dentro de la burbuja
-        if bubble.find_elements(By.XPATH, ".//img | .//video"):
-            return True
-    except Exception:
-        pass
-    return False
+######################################################### audio
+def bubble_kind(bubble):
+    # AUDIO: tu debug confirmó data-icon audio-play
+    if bubble.find_elements(By.XPATH, ".//*[@data-icon='audio-play' or @data-icon='ptt-play']"):
+        return "AUDIO"
 
+    # ADJUNTO: fotos/docs suelen traer botones con aria-label
+    if bubble.find_elements(By.XPATH, ".//*[@role='button' and contains(@aria-label,'Abrir foto')]"):
+        return "ADJUNTO"
+    if bubble.find_elements(By.XPATH, ".//*[@role='button' and (contains(@aria-label,'Descargar') or contains(@aria-label,'Download'))]"):
+        return "ADJUNTO"
+    if bubble.find_elements(By.XPATH, ".//*[@role='button' and contains(@aria-label,'Reenviar archivo')]"):
+        return "ADJUNTO"
+
+    # Fallback: si no hay texto pero hay img, suele ser media
+    txt = (bubble.text or "").strip()
+    if not txt and bubble.find_elements(By.TAG_NAME, "img"):
+        return "ADJUNTO"
+
+    return ""
+
+
+def meta_from_bubble(bubble):
+    # A veces el meta está en un descendiente del mismo row
+    meta_els = bubble.find_elements(By.XPATH, ".//*[@data-pre-plain-text]")
+    if meta_els:
+        return (meta_els[0].get_attribute("data-pre-plain-text") or "").strip()
+    return ""
+
+#-----------------------------------------------------------------
+#............................................................>>>>>>>>> scrollea y recolect los mensajes dentro de un chat
 def scrape_messages_from_current_chat(driver, contact):
     WebDriverWait(driver, 25).until(
         EC.presence_of_element_located((By.CSS_SELECTOR, "div.copyable-area"))
@@ -332,49 +315,56 @@ def scrape_messages_from_current_chat(driver, contact):
     last_len = 0
 
     while True:
-        # 1) Recolectar visible
+        # 1) TEXTOS “normales” (con meta)
         elements = driver.find_elements(By.XPATH, "//*[@data-pre-plain-text]")
+        # print("DEBUG elements meta =", len(elements))  # si quieres
+
         for el in elements:
             meta = (el.get_attribute("data-pre-plain-text") or "").strip()
             text = (el.text or "").strip()
-            # 🔥 AQUÍ VA: subir al contenedor burbuja del mensaje
-            try:
-                bubble = get_message_bubble_from_meta_el(el)
-                if bubble:
-                    labels = [x.get_attribute("aria-label") for x in bubble.find_elements(By.XPATH, ".//*[@role='button' and @aria-label]")]
-                    if labels:
-                        print("DEBUG labels:", labels[:5])
-            except Exception:
-                bubble = None
-            # Si no hay texto, detectar adjunto (foto/video) y marcarlo
-            if not text:
-                if bubble and bubble_has_attachment(bubble):
-                    text="[ADJUNTO]"
-            # si tampoco hay meta, no guardes
-            if not meta and text !="[ADJUNTO]":
-                continue
-            if any(el in meta for el in META_BANNED_CHARS):
-                continue
+
             if not meta and not text:
-                continue    
+                continue
+
             key = f"{meta}||{text}"
             if key not in messages:
                 messages[key] = {"contact": contact, "meta": meta, "text": text}
 
-        # 2) ¿ya llegamos al inicio?
+        # 2) AUDIOS / ADJUNTOS (aunque NO tengan data-pre-plain-text en el nodo que iteras)
+        bubbles = driver.find_elements(By.XPATH, "//div[@role='row']")
+        for b in bubbles:
+            kind = bubble_kind(b)
+            if not kind:
+                continue
+            # ✅ AQUÍ VA EL DEBUG (solo para AUDIO)
+            if kind == "AUDIO":
+                print("DEBUG meta candidates =", len(b.find_elements(By.XPATH, ".//*[@data-pre-plain-text]")))
+                
+            meta = meta_from_bubble(b)  # puede venir "" si WhatsApp no lo expone
+            text = f"[{kind}]"
+
+            # Dedupe: usamos meta + kind + preview del bubble para no repetir
+            preview = (b.text or "").strip().replace("\n", " ")[:80]
+            key = f"{meta}||{text}||{preview}"
+
+            if key not in messages:
+                messages[key] = {"contact": contact, "meta": meta, "text": text}
+            
+
+        # 3) Si ya llegamos al inicio, recién cortamos (pero YA guardamos lo visible)
         if end_to_end_banner_present(driver):
             print("🔒 Banner de cifrado detectado. Fin del historial alcanzado.")
             break
 
-        # 3) Click “mensajes anteriores del teléfono” si aparece
+        # 4) Click “mensajes anteriores del teléfono” si aparece
         if click_load_older_if_present(driver):
             time.sleep(1.8)
             continue
 
-        # 4) Un SOLO paso de scroll
+        # 5) Un paso de scroll hacia arriba
         scroll_chat_step(driver, scroller)
 
-        # 5) Watchdog suave (para no colgarse infinito)
+        # 6) watchdog suave
         if len(messages) == last_len:
             idle += 1
         else:
@@ -387,6 +377,8 @@ def scrape_messages_from_current_chat(driver, contact):
             idle = 0
 
     return list(messages.values())
+
+
 # ======================================================
 # 6) CSV
 # ======================================================
